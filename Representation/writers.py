@@ -179,23 +179,23 @@ def build_manifest(
 
     program_files = {
         "macro_profile.parquet": "Program object layer: one row per Program with macro scores, evidence, and confidence.",
-        "sample_burden.parquet": "Program sample-statistics layer: sample-level burden and representation support aggregated from Program results.",
-        "macro_summary.json": "Program structured reading layer for machine and human quick consumption.",
+        "sample_burden.parquet": "Program sample-statistics layer: sample-level burden, supported axes, spread, and full-axis overview aggregated from Program results.",
+        "macro_summary.json": "Program structured reading layer with state-oriented anchors, supported axes, full-axis overviews, and support profiles.",
         "macro_summary.md": "Program human-reading layer and current main readable entry for Program-level Representation.",
     }
     if cross_sample_comparability_path and cross_sample_summary_json_path and cross_sample_summary_md_path:
         program_files.update(
             {
-                "cross_sample_comparability.parquet": "Program cross-sample comparability layer: high-similarity Program pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Program cross-sample structured summary of nearest samples, shared tendencies, and sample-specific emphases.",
+                "cross_sample_comparability.parquet": "Program cross-sample comparability layer: full pairwise Program comparability table anchored on the current sample and compared against all eligible Programs from other samples.",
+                "cross_sample_summary.json": "Program cross-sample structured summary of nearest comparable state profiles, shared support tendencies, and sample-specific support patterns.",
                 "cross_sample_summary.md": "Program cross-sample human-reading summary page for comparable Program tendencies across samples.",
             }
         )
 
     domain_files = {
         "macro_profile.parquet": "Domain object layer: one row per Domain with inherited Program component scores, role refinements, morphology, and confidence.",
-        "sample_burden.parquet": "Domain sample-statistics layer: Domain-level component and role burdens aggregated within sample.",
-        "macro_summary.json": "Domain structured reading layer summarizing dominant component/role and representative domains.",
+        "sample_burden.parquet": "Domain sample-statistics layer: Domain-level component and role burdens with supported-axis and full-axis state summaries aggregated within sample.",
+        "macro_summary.json": "Domain structured reading layer summarizing leading anchors, supported axes, full-axis state overviews, and representative domains.",
         "macro_summary.md": "Domain human-reading layer and entry point for spatial entity-level macro interpretation.",
     }
     if (
@@ -206,15 +206,15 @@ def build_manifest(
         domain_files.update(
             {
                 "cross_sample_comparability.parquet": "Domain cross-sample comparability layer: high-similarity Domain pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Domain cross-sample structured summary of nearest samples, shared tendencies, and sample-specific entity emphases.",
+                "cross_sample_summary.json": "Domain cross-sample structured summary of nearest comparable state profiles, shared support tendencies, and sample-specific entity support patterns.",
                 "cross_sample_summary.md": "Domain cross-sample human-reading summary page for comparable Domain tendencies across samples.",
             }
         )
 
     niche_files = {
         "macro_profile.parquet": "Niche assembly layer: one row per niche with Domain component/role composition and lightweight structure fields.",
-        "sample_burden.parquet": "Niche sample-statistics layer: Niche-level component and role burdens aggregated within sample.",
-        "macro_summary.json": "Niche structured reading layer summarizing dominant component/role composition and representative niches.",
+        "sample_burden.parquet": "Niche sample-statistics layer: Niche-level component and role burdens with supported-axis and full-axis state summaries aggregated within sample.",
+        "macro_summary.json": "Niche structured reading layer summarizing leading anchors, supported axes, full-axis state overviews, and representative niches.",
         "macro_summary.md": "Niche human-reading layer and entry point for local assembly-level macro interpretation.",
     }
     if (
@@ -225,7 +225,7 @@ def build_manifest(
         niche_files.update(
             {
                 "cross_sample_comparability.parquet": "Niche cross-sample comparability layer: high-similarity Niche pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Niche cross-sample structured summary of nearest samples, shared local organization tendencies, and sample-specific Niche emphases.",
+                "cross_sample_summary.json": "Niche cross-sample structured summary of nearest comparable state profiles, shared local support tendencies, and sample-specific Niche support patterns.",
                 "cross_sample_summary.md": "Niche cross-sample human-reading summary page for comparable Niche tendencies across samples.",
             }
         )
@@ -242,6 +242,37 @@ def build_manifest(
             "input": cfg.input.__dict__,
             "eligibility": cfg.eligibility.__dict__,
             "scoring": cfg.scoring.__dict__,
+            "summary": cfg.summary.__dict__,
+        },
+        "summary_contract": {
+            "version": "state_oriented.v1",
+            "primary_fields": [
+                "leading_component_anchor",
+                "leading_role_anchor",
+                "supported_component_axes",
+                "supported_role_axes",
+                "component_axis_overview",
+                "role_axis_overview",
+                "component_support_profile",
+                "role_support_profile",
+                "component_support_spread",
+                "role_support_spread",
+                "component_state_type",
+                "role_state_type",
+                "component_state_summary",
+                "role_state_summary",
+                "cross_layer_state_summary",
+                "state_shift_summary",
+            ],
+            "supported_axis_threshold_component": float(cfg.summary.supported_axis_threshold_component),
+            "supported_axis_threshold_role": float(cfg.summary.supported_axis_threshold_role),
+            "supported_axes_order": "axis_definition_order",
+            "axis_overview_contract": "full_axis_complete_fixed_order",
+            "state_type_contract": str(cfg.summary.state_type_contract),
+            "state_summary_contract": str(cfg.summary.state_summary_contract),
+            "focused_summary_style": str(cfg.summary.focused_summary_style),
+            "secondary_fields_removed": True,
+            "dominant_fields_internal_only": True,
         },
         "outputs": {
             "axis_definition": rel(axis_definition_path),
@@ -280,8 +311,8 @@ def build_manifest(
             "sample": {
                 "status": "implemented_cross_layer",
                 "files": {
-                    "macro_summary.json": "Current final sample summary layer spanning Program, Domain, and Niche summaries.",
-                    "macro_summary.md": "Current human-readable bundle entry point spanning Program, Domain, and Niche summaries.",
+                    "macro_summary.json": "Current final sample summary layer spanning Program, Domain, and Niche state summaries with cross-layer continuity and shift descriptions.",
+                    "macro_summary.md": "Current human-readable bundle entry point spanning Program, Domain, and Niche state summaries.",
                 },
             },
         },
@@ -317,8 +348,8 @@ def enrich_manifest_with_cross_sample_outputs(
         program_files = dict(program_layout.get("files", {}) or {})
         program_files.update(
             {
-                "cross_sample_comparability.parquet": "Program cross-sample comparability layer: high-similarity Program pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Program cross-sample structured summary of nearest samples, shared tendencies, and sample-specific emphases.",
+                "cross_sample_comparability.parquet": "Program cross-sample comparability layer: full pairwise Program comparability table anchored on the current sample and compared against all eligible Programs from other samples.",
+                "cross_sample_summary.json": "Program cross-sample structured summary of nearest comparable state profiles, shared support tendencies, and sample-specific support patterns.",
                 "cross_sample_summary.md": "Program cross-sample human-reading summary page for comparable Program tendencies across samples.",
             }
         )
@@ -341,7 +372,7 @@ def enrich_manifest_with_cross_sample_outputs(
         domain_files.update(
             {
                 "cross_sample_comparability.parquet": "Domain cross-sample comparability layer: high-similarity Domain pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Domain cross-sample structured summary of nearest samples, shared tendencies, and sample-specific entity emphases.",
+                "cross_sample_summary.json": "Domain cross-sample structured summary of nearest comparable state profiles, shared support tendencies, and sample-specific entity support patterns.",
                 "cross_sample_summary.md": "Domain cross-sample human-reading summary page for comparable Domain tendencies across samples.",
             }
         )
@@ -364,7 +395,7 @@ def enrich_manifest_with_cross_sample_outputs(
         niche_files.update(
             {
                 "cross_sample_comparability.parquet": "Niche cross-sample comparability layer: high-similarity Niche pairs anchored on the current sample and compared against other samples.",
-                "cross_sample_summary.json": "Niche cross-sample structured summary of nearest samples, shared local organization tendencies, and sample-specific Niche emphases.",
+                "cross_sample_summary.json": "Niche cross-sample structured summary of nearest comparable state profiles, shared local support tendencies, and sample-specific Niche support patterns.",
                 "cross_sample_summary.md": "Niche cross-sample human-reading summary page for comparable Niche tendencies across samples.",
             }
         )

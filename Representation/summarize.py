@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 
 import numpy as np
@@ -329,6 +330,164 @@ def _pipe_split(value: object) -> list[str]:
     return [x for x in str(value or "").split("|") if x]
 
 
+def _supported_axis_threshold(cfg: RepresentationPipelineConfig, axis_type: str) -> float:
+    if str(axis_type) == "component":
+        return float(cfg.summary.supported_axis_threshold_component)
+    return float(cfg.summary.supported_axis_threshold_role)
+
+
+def _score_map_from_row(
+    burden_row: dict,
+    axis_ids: list[str],
+    suffix: str = "confidence_weighted_burden",
+) -> dict[str, float]:
+    return {axis_id: float(burden_row.get(f"{axis_id}_{suffix}", 0.0)) for axis_id in axis_ids}
+
+
+def _supported_axes_in_fixed_order(
+    axis_ids: list[str],
+    score_map: dict[str, float],
+    threshold: float,
+) -> list[str]:
+    return [axis_id for axis_id in axis_ids if float(score_map.get(axis_id, 0.0)) >= float(threshold)]
+
+
+def _axis_support_spread(axis_ids: list[str], score_map: dict[str, float]) -> float:
+    if not axis_ids:
+        return 0.0
+    values = np.asarray([max(float(score_map.get(axis_id, 0.0)), 0.0) for axis_id in axis_ids], dtype=np.float64)
+    total = float(values.sum())
+    if total <= 0.0:
+        return 0.0
+    norm = values / total
+    positive = norm[norm > 0]
+    if positive.size == 0:
+        return 0.0
+    return clamp01(float(-np.sum(positive * np.log(positive)) / np.log(max(len(axis_ids), 2))))
+
+
+def _axis_overview_entries(
+    axis_ids: list[str],
+    score_map: dict[str, float],
+    threshold: float,
+    extra_map: dict[str, dict] | None = None,
+) -> list[dict]:
+    rank_map = _rank_map(score_map)
+    extras = extra_map or {}
+    out: list[dict] = []
+    for axis_id in axis_ids:
+        entry = {
+            "axis": axis_id,
+            "score": float(score_map.get(axis_id, 0.0)),
+            "supported": bool(float(score_map.get(axis_id, 0.0)) >= float(threshold)),
+            "support_rank": int(rank_map.get(axis_id, 0)),
+        }
+        entry.update(extras.get(axis_id, {}))
+        out.append(entry)
+    return out
+
+
+def _auxiliary_local_participation_note(
+    axis_ids: list[str],
+    score_map: dict[str, float],
+    supported_axes: list[str],
+    threshold: float,
+) -> str:
+    lower = max(float(threshold) * 0.5, 0.05)
+    local_axes = [
+        axis_id
+        for axis_id in axis_ids
+        if axis_id not in supported_axes and float(score_map.get(axis_id, 0.0)) >= lower
+    ]
+    if not local_axes:
+        return ""
+    return f"Additional low-level participation is visible on {', '.join(local_axes)}."
+
+
+def _derive_state_type(
+    axis_ids: list[str],
+    score_map: dict[str, float],
+    supported_axes: list[str],
+    support_spread: float,
+    cfg: RepresentationPipelineConfig,
+) -> str:
+    ordered_scores = sorted([float(score_map.get(axis_id, 0.0)) for axis_id in axis_ids], reverse=True)
+    leading_score = float(ordered_scores[0]) if ordered_scores else 0.0
+    second_score = float(ordered_scores[1]) if len(ordered_scores) > 1 else 0.0
+    leading_margin = float(leading_score - second_score)
+    if len(supported_axes) == 0 and leading_score <= float(cfg.summary.diffuse_support_score_max):
+        return "diffuse_low_support"
+    if len(supported_axes) >= 3 or support_spread >= float(cfg.summary.mixed_support_spread_min):
+        return "mixed"
+    if len(supported_axes) == 2:
+        return "co_supported"
+    if len(supported_axes) == 1:
+        if (
+            support_spread <= float(cfg.summary.focused_support_spread_max)
+            and leading_margin >= float(cfg.summary.focused_leading_margin_min)
+        ):
+            return "focused"
+        return "focused"
+    return "diffuse_low_support"
+
+
+def _build_state_summary_text(
+    axis_label: str,
+    leading_anchor: str | None,
+    supported_axes: list[str],
+    state_type: str,
+) -> str:
+    label = str(axis_label).strip().capitalize() or "State"
+    if state_type == "focused":
+        if leading_anchor:
+            return f"{label} support is concentrated around `{leading_anchor}`, with limited co-support elsewhere."
+        return f"{label} support is concentrated without a clearly named leading axis."
+    if state_type == "co_supported":
+        if len(supported_axes) >= 2:
+            return f"{label} support is co-supported by `{supported_axes[0]}` and `{supported_axes[1]}`, rather than concentrated on a single axis."
+        if leading_anchor:
+            return f"{label} support is co-supported around `{leading_anchor}` and another aligned axis."
+    if state_type == "mixed":
+        if supported_axes:
+            return f"{label} support is distributed across multiple supported axes ({', '.join([f'`{axis}`' for axis in supported_axes])}), indicating a mixed state."
+        return f"{label} support is distributed across multiple axes, indicating a mixed state."
+    return f"{label} support remains broad but weak, without a strongly consolidated axis."
+
+
+def _build_support_profile(
+    axis_label: str,
+    axis_ids: list[str],
+    score_map: dict[str, float],
+    leading_anchor: str | None,
+    supported_axes: list[str],
+    support_spread: float,
+    cfg: RepresentationPipelineConfig,
+    threshold: float,
+) -> dict:
+    state_type = _derive_state_type(axis_ids, score_map, supported_axes, support_spread, cfg)
+    return {
+        "leading_anchor": leading_anchor,
+        "supported_axes": list(supported_axes),
+        "support_spread": float(support_spread),
+        "state_type": state_type,
+        "summary_text": _build_state_summary_text(axis_label, leading_anchor, supported_axes, state_type),
+        "auxiliary_local_participation_note": _auxiliary_local_participation_note(
+            axis_ids=axis_ids,
+            score_map=score_map,
+            supported_axes=supported_axes,
+            threshold=threshold,
+        ),
+    }
+
+
+def _overview_json_snapshot(entries: list[dict]) -> str:
+    return json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+
+
+def _profile_strength(entry: dict) -> float:
+    return float(entry.get("score", entry.get("confidence_weighted_burden", 0.0)) or 0.0)
+
+
 def build_sample_burden_table(
     bundle: RepresentationInputBundle,
     program_profile_df: pd.DataFrame,
@@ -344,8 +503,12 @@ def build_sample_burden_table(
         for axis_id in [*component_ids, *role_ids]:
             row[f"{axis_id}_raw_burden"] = 0.0
             row[f"{axis_id}_confidence_weighted_burden"] = 0.0
-        row["dominant_component_axes"] = ""
-        row["dominant_role_axes"] = ""
+        row["supported_component_axes"] = ""
+        row["supported_role_axes"] = ""
+        row["component_support_spread"] = 0.0
+        row["role_support_spread"] = 0.0
+        row["component_burden_profile"] = "[]"
+        row["role_burden_profile"] = "[]"
         return pd.DataFrame([row])
 
     eligible["raw_weight_base"] = pd.to_numeric(eligible["activation_mass"], errors="coerce").fillna(0.0).clip(lower=0.0)
@@ -404,13 +567,6 @@ def build_sample_burden_table(
         (eligible["confidence_weight"] * eligible["node_like"]).sum()
     ) if "node_like" in eligible.columns else 0.0
 
-    top_k = max(1, int(cfg.scoring.dominant_axis_top_k))
-    row["dominant_component_axes"] = _pipe_join(
-        [axis_id for axis_id, _ in sorted(component_conf_burdens.items(), key=lambda x: (-x[1], x[0]))[:top_k]]
-    )
-    row["dominant_role_axes"] = _pipe_join(
-        [axis_id for axis_id, _ in sorted(role_conf_burdens.items(), key=lambda x: (-x[1], x[0]))[:top_k]]
-    )
     competing_node_roles = [role_conf_burdens.get(axis_id, 0.0) for axis_id in role_ids if axis_id != "node_like"]
     node_competing_max = max(competing_node_roles) if competing_node_roles else 0.0
     row["node_like_dominance_margin"] = float(role_conf_burdens.get("node_like", 0.0) - node_competing_max)
@@ -484,6 +640,52 @@ def build_sample_burden_table(
     for axis_id in component_ids:
         row[f"{axis_id}_axis_burden_rank"] = int(burden_rank_map.get(axis_id, 0))
         row[f"{axis_id}_axis_representation_rank"] = int(representation_rank_map.get(axis_id, 0))
+
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    row["supported_component_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(component_ids, component_conf_burdens, component_threshold)
+    )
+    row["supported_role_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(role_ids, role_conf_burdens, role_threshold)
+    )
+    row["component_support_spread"] = _axis_support_spread(component_ids, component_conf_burdens)
+    row["role_support_spread"] = _axis_support_spread(role_ids, role_conf_burdens)
+    component_profile_entries = _axis_overview_entries(
+        axis_ids=component_ids,
+        score_map=component_conf_burdens,
+        threshold=component_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representation_support": float(row.get(f"{axis_id}_representation_support", 0.0)),
+                "primary_axis_program_count": int(row.get(f"{axis_id}_primary_axis_program_count", 0)),
+                "high_confidence_primary_axis_program_count": int(
+                    row.get(f"{axis_id}_high_confidence_primary_axis_program_count", 0)
+                ),
+                "representative_program_count": int(row.get(f"{axis_id}_representative_program_count", 0)),
+                "top_program_contribution_share": float(row.get(f"{axis_id}_top_program_contribution_share", 0.0)),
+                "burden_rank": int(row.get(f"{axis_id}_axis_burden_rank", 0)),
+                "representation_rank": int(row.get(f"{axis_id}_axis_representation_rank", 0)),
+            }
+            for axis_id in component_ids
+        },
+    )
+    role_profile_entries = _axis_overview_entries(
+        axis_ids=role_ids,
+        score_map=role_conf_burdens,
+        threshold=role_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+            }
+            for axis_id in role_ids
+        },
+    )
+    row["component_burden_profile"] = _overview_json_snapshot(component_profile_entries)
+    row["role_burden_profile"] = _overview_json_snapshot(role_profile_entries)
 
     return pd.DataFrame([row])
 
@@ -706,25 +908,58 @@ def build_sample_summary_payload(
     component_ids = [axis.axis_id for axis in component_axes]
     role_ids = [axis.axis_id for axis in role_axes]
     burden_row = sample_burden_df.iloc[0].to_dict()
-    dominant_component_axes = _pipe_split(burden_row.get("dominant_component_axes", ""))
-    dominant_role_axes = _pipe_split(burden_row.get("dominant_role_axes", ""))
     eligible = program_profile_df.loc[program_profile_df["eligible_for_burden"].astype(bool)].copy()
     summary_candidates = _summary_candidates(program_profile_df, cfg)
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    component_score_map = _score_map_from_row(burden_row, component_ids)
+    role_score_map = _score_map_from_row(burden_row, role_ids)
 
     if eligible.empty:
         return {
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
-            "dominant_component_axes": [],
-            "dominant_role_axes": [],
-            "dominant_component_signature": None,
-            "secondary_component_signature": None,
-            "dominant_role_signature": None,
-            "secondary_role_signature": None,
+            "leading_component_anchor": None,
+            "leading_role_anchor": None,
+            "supported_component_axes": [],
+            "supported_role_axes": [],
+            "component_axis_overview": [],
+            "role_axis_overview": [],
+            "component_support_profile": {
+                "leading_anchor": None,
+                "supported_axes": [],
+                "support_spread": 0.0,
+                "state_type": "diffuse_low_support",
+                "summary_text": "Component support remains broad but weak, without a strongly consolidated axis.",
+                "auxiliary_local_participation_note": "",
+            },
+            "role_support_profile": {
+                "leading_anchor": None,
+                "supported_axes": [],
+                "support_spread": 0.0,
+                "state_type": "diffuse_low_support",
+                "summary_text": "Role support remains broad but weak, without a strongly consolidated axis.",
+                "auxiliary_local_participation_note": "",
+            },
+            "component_support_spread": 0.0,
+            "role_support_spread": 0.0,
+            "component_state_type": "diffuse_low_support",
+            "role_state_type": "diffuse_low_support",
+            "component_state_summary": "Component support remains broad but weak, without a strongly consolidated axis.",
+            "role_state_summary": "Role support remains broad but weak, without a strongly consolidated axis.",
             "top_programs": [],
-            "top_contributing_programs_by_component": [],
-            "top_contributing_programs_by_role": [],
+            "representative_objects_by_component_axis": [],
+            "representative_objects_by_role_axis": [],
             "program_level_overview": [],
+            "summary_reliability_hint": "low",
+            "component_summary_reliability": "low",
+            "summary_reliability_metrics": {
+                "eligible_program_count": 0,
+                "low_information_ratio": 1.0,
+                "annotation_deficit_ratio": 1.0,
+                "dominant_component_margin": 0.0,
+                "dominant_role_margin": 0.0,
+            },
         }
 
     eligible["raw_weight_base"] = pd.to_numeric(eligible["activation_mass"], errors="coerce").fillna(0.0).clip(lower=0.0)
@@ -780,87 +1015,129 @@ def build_sample_summary_payload(
             }
         )
 
-    top_component_axes_for_summary = dominant_component_axes[:2]
     component_order_for_summary, component_summary_diag = _resolve_component_order_for_summary(
         burden_row=burden_row,
         component_ids=component_ids,
         cfg=cfg,
     )
-    final_component_axes_for_summary = component_order_for_summary[:2]
     role_order_for_summary, node_like_role_diag = _resolve_role_order_for_summary(burden_row, role_ids, cfg)
-    top_role_axes_for_summary = role_order_for_summary[:2]
+    leading_component_anchor = component_order_for_summary[0] if component_order_for_summary else None
+    leading_role_anchor = role_order_for_summary[0] if role_order_for_summary else None
+    supported_component_axes = _supported_axes_in_fixed_order(component_ids, component_score_map, component_threshold)
+    supported_role_axes = _supported_axes_in_fixed_order(role_ids, role_score_map, role_threshold)
+    component_overview = _axis_overview_entries(
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        threshold=component_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representation_support": float(burden_row.get(f"{axis_id}_representation_support", 0.0)),
+                "primary_axis_program_count": int(burden_row.get(f"{axis_id}_primary_axis_program_count", 0)),
+                "high_confidence_primary_axis_program_count": int(
+                    burden_row.get(f"{axis_id}_high_confidence_primary_axis_program_count", 0)
+                ),
+                "representative_program_count": int(burden_row.get(f"{axis_id}_representative_program_count", 0)),
+                "top_program_contribution_share": float(burden_row.get(f"{axis_id}_top_program_contribution_share", 0.0)),
+                "burden_rank": int(burden_row.get(f"{axis_id}_axis_burden_rank", 0)),
+                "representation_rank": int(burden_row.get(f"{axis_id}_axis_representation_rank", 0)),
+            }
+            for axis_id in component_ids
+        },
+    )
+    role_overview = _axis_overview_entries(
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        threshold=role_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+            }
+            for axis_id in role_ids
+        },
+    )
+    component_support_spread = _axis_support_spread(component_ids, component_score_map)
+    role_support_spread = _axis_support_spread(role_ids, role_score_map)
+    component_profile = _build_support_profile(
+        axis_label="component",
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        leading_anchor=leading_component_anchor,
+        supported_axes=supported_component_axes,
+        support_spread=component_support_spread,
+        cfg=cfg,
+        threshold=component_threshold,
+    )
+    role_profile = _build_support_profile(
+        axis_label="role",
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        leading_anchor=leading_role_anchor,
+        supported_axes=supported_role_axes,
+        support_spread=role_support_spread,
+        cfg=cfg,
+        threshold=role_threshold,
+    )
+    component_contributor_axes = supported_component_axes[: max(1, int(cfg.scoring.top_programs_per_axis))]
+    if not component_contributor_axes and leading_component_anchor:
+        component_contributor_axes = [leading_component_anchor]
+    role_contributor_axes = supported_role_axes[: max(1, int(cfg.scoring.top_programs_per_axis))]
+    if not role_contributor_axes and leading_role_anchor:
+        role_contributor_axes = [leading_role_anchor]
     component_contributors = [
         {
             "axis": axis_id,
             "programs": _top_programs_for_axis(summary_candidates, axis_id, "confidence_weight_base", cfg.scoring.top_programs_per_axis),
         }
-        for axis_id in final_component_axes_for_summary
+        for axis_id in component_contributor_axes
     ]
     role_contributors = [
         {
             "axis": axis_id,
             "programs": _top_programs_for_axis(summary_candidates, axis_id, "confidence_weight_base", cfg.scoring.top_programs_per_axis),
         }
-        for axis_id in top_role_axes_for_summary
+        for axis_id in role_contributor_axes
     ]
     low_information_ratio = float(eligible["low_information_flag"].astype(bool).mean()) if len(eligible) else 1.0
     annotation_deficit_ratio = float(eligible["information_deficit_annotation"].astype(bool).mean()) if len(eligible) else 1.0
     dominant_component_margin = 0.0
     dominant_role_margin = 0.0
-    if len(dominant_component_axes) >= 2:
+    if len(component_order_for_summary) >= 2:
         dominant_component_margin = float(
-            burden_row.get(f"{dominant_component_axes[0]}_confidence_weighted_burden", 0.0)
-            - burden_row.get(f"{dominant_component_axes[1]}_confidence_weighted_burden", 0.0)
+            burden_row.get(f"{component_order_for_summary[0]}_confidence_weighted_burden", 0.0)
+            - burden_row.get(f"{component_order_for_summary[1]}_confidence_weighted_burden", 0.0)
         )
-    elif len(dominant_component_axes) == 1:
-        dominant_component_margin = float(burden_row.get(f"{dominant_component_axes[0]}_confidence_weighted_burden", 0.0))
-    if len(dominant_role_axes) >= 2:
+    elif len(component_order_for_summary) == 1:
+        dominant_component_margin = float(
+            burden_row.get(f"{component_order_for_summary[0]}_confidence_weighted_burden", 0.0)
+        )
+    if len(role_order_for_summary) >= 2:
         dominant_role_margin = float(
-            burden_row.get(f"{top_role_axes_for_summary[0]}_confidence_weighted_burden", 0.0)
-            - burden_row.get(f"{top_role_axes_for_summary[1]}_confidence_weighted_burden", 0.0)
+            burden_row.get(f"{role_order_for_summary[0]}_confidence_weighted_burden", 0.0)
+            - burden_row.get(f"{role_order_for_summary[1]}_confidence_weighted_burden", 0.0)
         )
-    elif len(top_role_axes_for_summary) == 1:
-        dominant_role_margin = float(burden_row.get(f"{top_role_axes_for_summary[0]}_confidence_weighted_burden", 0.0))
+    elif len(role_order_for_summary) == 1:
+        dominant_role_margin = float(burden_row.get(f"{role_order_for_summary[0]}_confidence_weighted_burden", 0.0))
 
     return {
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
-        "dominant_component_axes": [
-            _component_summary_signature(burden_row, axis_id) for axis_id in final_component_axes_for_summary if axis_id
-        ],
-        "dominant_role_axes": [
-            _signature_record(burden_row, axis_id) for axis_id in top_role_axes_for_summary if axis_id
-        ],
-        "dominant_component_signature": _component_summary_signature(
-            burden_row, final_component_axes_for_summary[0] if final_component_axes_for_summary else None
-        ),
-        "secondary_component_signature": _component_summary_signature(
-            burden_row, final_component_axes_for_summary[1] if len(final_component_axes_for_summary) > 1 else None
-        ),
-        "dominant_component_by_burden": _component_summary_signature(
-            burden_row, dominant_component_axes[0] if dominant_component_axes else None
-        ),
-        "dominant_component_by_representation": _component_summary_signature(
-            burden_row, component_summary_diag.get("dominant_component_by_representation") or None
-        ),
-        "dominant_component_final": _component_summary_signature(
-            burden_row, final_component_axes_for_summary[0] if final_component_axes_for_summary else None
-        ),
-        "secondary_component_final": _component_summary_signature(
-            burden_row, final_component_axes_for_summary[1] if len(final_component_axes_for_summary) > 1 else None
-        ),
-        "dominant_role_signature": _signature_record(burden_row, top_role_axes_for_summary[0] if top_role_axes_for_summary else None),
-        "secondary_role_signature": _signature_record(burden_row, top_role_axes_for_summary[1] if len(top_role_axes_for_summary) > 1 else None),
-        "component_representation_support_summary": [
-            _component_summary_signature(burden_row, axis_id)
-            for axis_id in sorted(
-                component_ids,
-                key=lambda axis_id: (
-                    -float(burden_row.get(f"{axis_id}_representation_support", 0.0)),
-                    axis_id,
-                ),
-            )
-        ],
+        "leading_component_anchor": leading_component_anchor,
+        "leading_role_anchor": leading_role_anchor,
+        "supported_component_axes": supported_component_axes,
+        "supported_role_axes": supported_role_axes,
+        "component_axis_overview": component_overview,
+        "role_axis_overview": role_overview,
+        "component_support_profile": component_profile,
+        "role_support_profile": role_profile,
+        "component_support_spread": float(component_support_spread),
+        "role_support_spread": float(role_support_spread),
+        "component_state_type": str(component_profile["state_type"]),
+        "role_state_type": str(role_profile["state_type"]),
+        "component_state_summary": str(component_profile["summary_text"]),
+        "role_state_summary": str(role_profile["summary_text"]),
         "component_summary_reliability": _component_summary_reliability(burden_row, component_ids),
         "summary_reliability_hint": _summary_reliability_hint(
             eligible_program_count=int(eligible.shape[0]),
@@ -884,42 +1161,53 @@ def build_sample_summary_payload(
             "node_like_competing_max": float(node_like_role_diag.get("node_like_competing_max", 0.0)),
         },
         "top_programs": top_programs,
-        "top_contributing_programs_by_component": component_contributors,
-        "top_contributing_programs_by_role": role_contributors,
+        "representative_objects_by_component_axis": component_contributors,
+        "representative_objects_by_role_axis": role_contributors,
         "program_level_overview": overview,
+        "deprecated_internal_fields": {
+            "internal_summary_anchor": True,
+            "deprecated_primary_narrative_field": True,
+            "dominant_component_by_burden": _component_summary_signature(
+                burden_row, component_summary_diag.get("dominant_component_by_burden") or None
+            ),
+            "dominant_component_by_representation": _component_summary_signature(
+                burden_row, component_summary_diag.get("dominant_component_by_representation") or None
+            ),
+            "dominant_component_final": _component_summary_signature(
+                burden_row, leading_component_anchor
+            ),
+            "dominant_role_signature": _signature_record(burden_row, leading_role_anchor),
+        },
     }
 
 
 def build_program_summary_markdown(summary: dict) -> str:
-    dominant_component_by_burden = summary.get("dominant_component_by_burden") or {}
-    dominant_component_by_representation = summary.get("dominant_component_by_representation") or {}
-    dominant_component_final = summary.get("dominant_component_final") or {}
-    secondary_component_final = summary.get("secondary_component_final") or {}
-    dominant_role = summary.get("dominant_role_signature") or {}
-    secondary_role = summary.get("secondary_role_signature") or {}
+    supported_components = summary.get("supported_component_axes") or []
+    supported_roles = summary.get("supported_role_axes") or []
     representative_programs = [item.get("program_id", "") for item in (summary.get("top_programs") or []) if item.get("program_id")]
-    overview = (
-        f"Program-level macro portrait is centered on `{dominant_component_final.get('axis', 'NA')}` "
-        f"with secondary emphasis on `{secondary_component_final.get('axis', 'NA')}`, while the role layer "
-        f"is led by `{dominant_role.get('axis', 'NA')}` and `{secondary_role.get('axis', 'NA')}`."
-    )
+    overview = str(summary.get("component_state_summary", ""))
+    role_overview = str(summary.get("role_state_summary", ""))
     lines = [
         "# Program Macro Summary",
         "",
         f"- sample_id: `{summary.get('sample_id', '')}`",
         f"- cancer_type: `{summary.get('cancer_type', '')}`",
-        f"- dominant_component_by_burden: `{dominant_component_by_burden.get('axis', 'NA')}`",
-        f"- dominant_component_by_representation: `{dominant_component_by_representation.get('axis', 'NA')}`",
-        f"- dominant_component_final: `{dominant_component_final.get('axis', 'NA')}`",
-        f"- secondary_component_final: `{secondary_component_final.get('axis', 'NA')}`",
-        f"- dominant_role_signature: `{dominant_role.get('axis', 'NA')}`",
-        f"- secondary_role_signature: `{secondary_role.get('axis', 'NA')}`",
+        f"- leading_component_anchor: `{summary.get('leading_component_anchor', 'NA') or 'NA'}`",
+        f"- supported_component_axes: `{', '.join([str(x) for x in supported_components]) if supported_components else 'NA'}`",
+        f"- component_support_spread: `{float(summary.get('component_support_spread', 0.0)):.3f}`",
+        f"- component_state_type: `{summary.get('component_state_type', 'NA')}`",
+        f"- leading_role_anchor: `{summary.get('leading_role_anchor', 'NA') or 'NA'}`",
+        f"- supported_role_axes: `{', '.join([str(x) for x in supported_roles]) if supported_roles else 'NA'}`",
+        f"- role_support_spread: `{float(summary.get('role_support_spread', 0.0)):.3f}`",
+        f"- role_state_type: `{summary.get('role_state_type', 'NA')}`",
         f"- summary_reliability_hint: `{summary.get('summary_reliability_hint', 'NA')}`",
         f"- representative_programs: `{', '.join(representative_programs) if representative_programs else 'NA'}`",
         "",
         "## Structured Overview",
         "",
         overview,
+        "",
+        role_overview,
         "",
     ]
     return "\n".join(lines).strip() + "\n"
@@ -1077,8 +1365,6 @@ def build_program_cross_sample_comparability_table(
         .astype(int)
         + 1
     )
-    top_k = max(1, int(cfg.scoring.cross_sample_comparable_top_k))
-    pairs = pairs.loc[pairs["comparable_rank_within_program_a"] <= top_k].copy()
     pairs["short_comparability_note"] = pairs.apply(
         lambda row: (
             f"Shared tendency is strongest in component ({row['component_similarity']:.2f}) "
@@ -1138,10 +1424,10 @@ def build_program_cross_sample_summary_payload(
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
             "nearest_comparable_samples": [],
-            "shared_dominant_component_tendencies": [],
-            "shared_dominant_role_tendencies": [],
-            "sample_specific_component_emphasis": [],
-            "sample_specific_role_emphasis": [],
+            "shared_component_support_tendencies": [],
+            "shared_role_support_tendencies": [],
+            "sample_specific_component_support_patterns": [],
+            "sample_specific_role_support_patterns": [],
             "top_comparable_program_pairs": [],
             "comparability_reliability_hint": "low",
             "reference_sample_count": 0,
@@ -1162,11 +1448,11 @@ def build_program_cross_sample_summary_payload(
                 "pair_count": pair_count,
                 "top_similarity": top_max,
                 "mean_similarity": top_mean,
-                "dominant_component_final": (
-                    (reference_program_summary_map.get(str(sample_id_b), {}).get("dominant_component_final") or {}).get("axis", "")
+                "leading_component_anchor": str(
+                    reference_program_summary_map.get(str(sample_id_b), {}).get("leading_component_anchor") or ""
                 ),
-                "dominant_role_signature": (
-                    (reference_program_summary_map.get(str(sample_id_b), {}).get("dominant_role_signature") or {}).get("axis", "")
+                "leading_role_anchor": str(
+                    reference_program_summary_map.get(str(sample_id_b), {}).get("leading_role_anchor") or ""
                 ),
             }
         )
@@ -1257,10 +1543,10 @@ def build_program_cross_sample_summary_payload(
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
         "nearest_comparable_samples": nearest_samples,
-        "shared_dominant_component_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "shared_dominant_role_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "sample_specific_component_emphasis": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
-        "sample_specific_role_emphasis": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
+        "shared_component_support_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "shared_role_support_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "sample_specific_component_support_patterns": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
+        "sample_specific_role_support_patterns": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
         "top_comparable_program_pairs": top_pairs,
         "comparability_reliability_hint": _comparability_reliability_hint(
             reference_sample_count=len(matched_reference_ids),
@@ -1274,10 +1560,10 @@ def build_program_cross_sample_summary_payload(
 
 def build_program_cross_sample_summary_markdown(summary: dict) -> str:
     nearest_samples = [item.get("sample_id", "") for item in (summary.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-    shared_components = [item.get("axis", "") for item in (summary.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-    shared_roles = [item.get("axis", "") for item in (summary.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
-    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_emphasis") or []) if item.get("axis")]
-    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_emphasis") or []) if item.get("axis")]
+    shared_components = [item.get("axis", "") for item in (summary.get("shared_component_support_tendencies") or []) if item.get("axis")]
+    shared_roles = [item.get("axis", "") for item in (summary.get("shared_role_support_tendencies") or []) if item.get("axis")]
+    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_support_patterns") or []) if item.get("axis")]
+    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_support_patterns") or []) if item.get("axis")]
     top_pairs = summary.get("top_comparable_program_pairs") or []
     top_pair_labels = [
         f"{item.get('program_id_a', '')}->{item.get('sample_id_b', '')}:{item.get('program_id_b', '')}"
@@ -1290,10 +1576,10 @@ def build_program_cross_sample_summary_markdown(summary: dict) -> str:
         f"- sample_id: `{summary.get('sample_id', '')}`",
         f"- cancer_type: `{summary.get('cancer_type', '')}`",
         f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-        f"- shared dominant component tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
-        f"- shared dominant role tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
-        f"- sample-specific component emphasis: `{', '.join(specific_components) if specific_components else 'NA'}`",
-        f"- sample-specific role emphasis: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
+        f"- shared component support tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
+        f"- shared role support tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+        f"- sample-specific component support patterns: `{', '.join(specific_components) if specific_components else 'NA'}`",
+        f"- sample-specific role support patterns: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
         f"- top comparable program pairs: `{', '.join(top_pair_labels) if top_pair_labels else 'NA'}`",
         f"- comparability_reliability_hint: `{summary.get('comparability_reliability_hint', 'NA')}`",
         "",
@@ -1301,7 +1587,7 @@ def build_program_cross_sample_summary_markdown(summary: dict) -> str:
         "",
         (
             f"Program comparability places `{summary.get('sample_id', '')}` nearest to "
-            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared tendencies in "
+            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared component support in "
             f"`{shared_components[0] if shared_components else 'NA'}` and `{shared_roles[0] if shared_roles else 'NA'}`."
         ),
         "",
@@ -1517,10 +1803,10 @@ def build_domain_cross_sample_summary_payload(
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
             "nearest_comparable_samples": [],
-            "shared_dominant_component_tendencies": [],
-            "shared_dominant_role_tendencies": [],
-            "sample_specific_component_emphasis": [],
-            "sample_specific_role_emphasis": [],
+            "shared_component_support_tendencies": [],
+            "shared_role_support_tendencies": [],
+            "sample_specific_component_support_patterns": [],
+            "sample_specific_role_support_patterns": [],
             "top_comparable_domain_pairs": [],
             "comparability_reliability_hint": "low",
             "reference_sample_count": 0,
@@ -1541,11 +1827,11 @@ def build_domain_cross_sample_summary_payload(
                 "pair_count": pair_count,
                 "top_similarity": top_max,
                 "mean_similarity": top_mean,
-                "dominant_component": (
-                    (reference_domain_summary_map.get(str(sample_id_b), {}).get("dominant_component") or {}).get("axis", "")
+                "leading_component_anchor": str(
+                    reference_domain_summary_map.get(str(sample_id_b), {}).get("leading_component_anchor") or ""
                 ),
-                "dominant_role": (
-                    (reference_domain_summary_map.get(str(sample_id_b), {}).get("dominant_role") or {}).get("axis", "")
+                "leading_role_anchor": str(
+                    reference_domain_summary_map.get(str(sample_id_b), {}).get("leading_role_anchor") or ""
                 ),
             }
         )
@@ -1639,10 +1925,10 @@ def build_domain_cross_sample_summary_payload(
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
         "nearest_comparable_samples": nearest_samples,
-        "shared_dominant_component_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "shared_dominant_role_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "sample_specific_component_emphasis": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
-        "sample_specific_role_emphasis": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
+        "shared_component_support_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "shared_role_support_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "sample_specific_component_support_patterns": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
+        "sample_specific_role_support_patterns": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
         "top_comparable_domain_pairs": top_pairs,
         "comparability_reliability_hint": _comparability_reliability_hint(
             reference_sample_count=len(matched_reference_ids),
@@ -1656,10 +1942,10 @@ def build_domain_cross_sample_summary_payload(
 
 def build_domain_cross_sample_summary_markdown(summary: dict) -> str:
     nearest_samples = [item.get("sample_id", "") for item in (summary.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-    shared_components = [item.get("axis", "") for item in (summary.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-    shared_roles = [item.get("axis", "") for item in (summary.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
-    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_emphasis") or []) if item.get("axis")]
-    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_emphasis") or []) if item.get("axis")]
+    shared_components = [item.get("axis", "") for item in (summary.get("shared_component_support_tendencies") or []) if item.get("axis")]
+    shared_roles = [item.get("axis", "") for item in (summary.get("shared_role_support_tendencies") or []) if item.get("axis")]
+    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_support_patterns") or []) if item.get("axis")]
+    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_support_patterns") or []) if item.get("axis")]
     top_pairs = summary.get("top_comparable_domain_pairs") or []
     top_pair_labels = [
         f"{item.get('domain_id_a', '')}->{item.get('sample_id_b', '')}:{item.get('domain_id_b', '')}"
@@ -1672,10 +1958,10 @@ def build_domain_cross_sample_summary_markdown(summary: dict) -> str:
         f"- sample_id: `{summary.get('sample_id', '')}`",
         f"- cancer_type: `{summary.get('cancer_type', '')}`",
         f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-        f"- shared dominant component tendencies at Domain level: `{', '.join(shared_components) if shared_components else 'NA'}`",
-        f"- shared dominant role tendencies at Domain level: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
-        f"- sample-specific component emphasis at Domain level: `{', '.join(specific_components) if specific_components else 'NA'}`",
-        f"- sample-specific role emphasis at Domain level: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
+        f"- shared component support tendencies at Domain level: `{', '.join(shared_components) if shared_components else 'NA'}`",
+        f"- shared role support tendencies at Domain level: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+        f"- sample-specific component support patterns at Domain level: `{', '.join(specific_components) if specific_components else 'NA'}`",
+        f"- sample-specific role support patterns at Domain level: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
         f"- top comparable domain pairs: `{', '.join(top_pair_labels) if top_pair_labels else 'NA'}`",
         f"- comparability_reliability_hint: `{summary.get('comparability_reliability_hint', 'NA')}`",
         "",
@@ -1683,7 +1969,7 @@ def build_domain_cross_sample_summary_markdown(summary: dict) -> str:
         "",
         (
             f"Domain comparability places `{summary.get('sample_id', '')}` nearest to "
-            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared Domain tendencies in "
+            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared Domain support tendencies in "
             f"`{shared_components[0] if shared_components else 'NA'}` and `{shared_roles[0] if shared_roles else 'NA'}`."
         ),
         "",
@@ -1889,10 +2175,10 @@ def build_niche_cross_sample_summary_payload(
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
             "nearest_comparable_samples": [],
-            "shared_dominant_component_tendencies": [],
-            "shared_dominant_role_tendencies": [],
-            "sample_specific_component_emphasis": [],
-            "sample_specific_role_emphasis": [],
+            "shared_component_support_tendencies": [],
+            "shared_role_support_tendencies": [],
+            "sample_specific_component_support_patterns": [],
+            "sample_specific_role_support_patterns": [],
             "top_comparable_niche_pairs": [],
             "comparability_reliability_hint": "low",
             "reference_sample_count": 0,
@@ -1913,11 +2199,11 @@ def build_niche_cross_sample_summary_payload(
                 "pair_count": pair_count,
                 "top_similarity": top_max,
                 "mean_similarity": top_mean,
-                "dominant_component_mix": (
-                    (reference_niche_summary_map.get(str(sample_id_b), {}).get("dominant_component_mix") or {}).get("axis", "")
+                "leading_component_anchor": str(
+                    reference_niche_summary_map.get(str(sample_id_b), {}).get("leading_component_anchor") or ""
                 ),
-                "dominant_role_mix": (
-                    (reference_niche_summary_map.get(str(sample_id_b), {}).get("dominant_role_mix") or {}).get("axis", "")
+                "leading_role_anchor": str(
+                    reference_niche_summary_map.get(str(sample_id_b), {}).get("leading_role_anchor") or ""
                 ),
             }
         )
@@ -2009,10 +2295,10 @@ def build_niche_cross_sample_summary_payload(
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
         "nearest_comparable_samples": nearest_samples,
-        "shared_dominant_component_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "shared_dominant_role_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
-        "sample_specific_component_emphasis": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
-        "sample_specific_role_emphasis": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
+        "shared_component_support_tendencies": sorted(shared_component_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "shared_role_support_tendencies": sorted(shared_role_scores, key=lambda item: (-item["score"], item["axis"]))[:3],
+        "sample_specific_component_support_patterns": [item for item in sample_specific_components if item["delta"] > 0.01][:3],
+        "sample_specific_role_support_patterns": [item for item in sample_specific_roles if item["delta"] > 0.01][:3],
         "top_comparable_niche_pairs": top_pairs,
         "comparability_reliability_hint": _comparability_reliability_hint(
             reference_sample_count=len(matched_reference_ids),
@@ -2026,10 +2312,10 @@ def build_niche_cross_sample_summary_payload(
 
 def build_niche_cross_sample_summary_markdown(summary: dict) -> str:
     nearest_samples = [item.get("sample_id", "") for item in (summary.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-    shared_components = [item.get("axis", "") for item in (summary.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-    shared_roles = [item.get("axis", "") for item in (summary.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
-    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_emphasis") or []) if item.get("axis")]
-    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_emphasis") or []) if item.get("axis")]
+    shared_components = [item.get("axis", "") for item in (summary.get("shared_component_support_tendencies") or []) if item.get("axis")]
+    shared_roles = [item.get("axis", "") for item in (summary.get("shared_role_support_tendencies") or []) if item.get("axis")]
+    specific_components = [item.get("axis", "") for item in (summary.get("sample_specific_component_support_patterns") or []) if item.get("axis")]
+    specific_roles = [item.get("axis", "") for item in (summary.get("sample_specific_role_support_patterns") or []) if item.get("axis")]
     top_pairs = summary.get("top_comparable_niche_pairs") or []
     top_pair_labels = [
         f"{item.get('niche_id_a', '')}->{item.get('sample_id_b', '')}:{item.get('niche_id_b', '')}"
@@ -2042,10 +2328,10 @@ def build_niche_cross_sample_summary_markdown(summary: dict) -> str:
         f"- sample_id: `{summary.get('sample_id', '')}`",
         f"- cancer_type: `{summary.get('cancer_type', '')}`",
         f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-        f"- shared dominant component composition tendencies at Niche level: `{', '.join(shared_components) if shared_components else 'NA'}`",
-        f"- shared dominant role composition tendencies at Niche level: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
-        f"- sample-specific component emphasis at Niche level: `{', '.join(specific_components) if specific_components else 'NA'}`",
-        f"- sample-specific role emphasis at Niche level: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
+        f"- shared component support tendencies at Niche level: `{', '.join(shared_components) if shared_components else 'NA'}`",
+        f"- shared role support tendencies at Niche level: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+        f"- sample-specific component support patterns at Niche level: `{', '.join(specific_components) if specific_components else 'NA'}`",
+        f"- sample-specific role support patterns at Niche level: `{', '.join(specific_roles) if specific_roles else 'NA'}`",
         f"- top comparable niche pairs: `{', '.join(top_pair_labels) if top_pair_labels else 'NA'}`",
         f"- comparability_reliability_hint: `{summary.get('comparability_reliability_hint', 'NA')}`",
         "",
@@ -2053,12 +2339,58 @@ def build_niche_cross_sample_summary_markdown(summary: dict) -> str:
         "",
         (
             f"Niche comparability places `{summary.get('sample_id', '')}` nearest to "
-            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared Niche tendencies in "
+            f"`{nearest_samples[0] if nearest_samples else 'NA'}` with shared Niche support tendencies in "
             f"`{shared_components[0] if shared_components else 'NA'}` and `{shared_roles[0] if shared_roles else 'NA'}`."
         ),
         "",
     ]
     return "\n".join(lines).strip() + "\n"
+
+
+def _overview_score_lookup(overview: list[dict] | None) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for item in overview or []:
+        axis = str(item.get("axis", "")).strip()
+        if not axis:
+            continue
+        out[axis] = _profile_strength(item)
+    return out
+
+
+def _shift_axes_between_layers(
+    earlier_overview: list[dict] | None,
+    later_overview: list[dict] | None,
+    axis_order: list[str],
+    min_delta: float = 0.05,
+) -> list[str]:
+    earlier = _overview_score_lookup(earlier_overview)
+    later = _overview_score_lookup(later_overview)
+    return [
+        axis_id
+        for axis_id in axis_order
+        if float(later.get(axis_id, 0.0) - earlier.get(axis_id, 0.0)) >= float(min_delta)
+    ]
+
+
+def _state_summary_section(summary: dict | None) -> dict:
+    payload = summary or {}
+    return {
+        "leading_component_anchor": payload.get("leading_component_anchor"),
+        "supported_component_axes": payload.get("supported_component_axes", []),
+        "component_axis_overview": payload.get("component_axis_overview", []),
+        "component_support_profile": payload.get("component_support_profile", {}),
+        "component_support_spread": payload.get("component_support_spread", 0.0),
+        "component_state_type": payload.get("component_state_type", "diffuse_low_support"),
+        "component_state_summary": payload.get("component_state_summary", ""),
+        "leading_role_anchor": payload.get("leading_role_anchor"),
+        "supported_role_axes": payload.get("supported_role_axes", []),
+        "role_axis_overview": payload.get("role_axis_overview", []),
+        "role_support_profile": payload.get("role_support_profile", {}),
+        "role_support_spread": payload.get("role_support_spread", 0.0),
+        "role_state_type": payload.get("role_state_type", "diffuse_low_support"),
+        "role_state_summary": payload.get("role_state_summary", ""),
+        "summary_reliability_hint": payload.get("summary_reliability_hint", "NA"),
+    }
 
 
 def build_sample_summary_view(
@@ -2069,26 +2401,87 @@ def build_sample_summary_view(
     domain_comparability_summary: dict | None = None,
     niche_comparability_summary: dict | None = None,
 ) -> dict:
-    dominant_component = summary.get("dominant_component_final") or summary.get("dominant_component_signature")
-    secondary_component = summary.get("secondary_component_final") or summary.get("secondary_component_signature")
-    dominant_role = summary.get("dominant_role_signature")
-    secondary_role = summary.get("secondary_role_signature")
+    program_state_summary = _state_summary_section(summary)
+    domain_state_summary = _state_summary_section(domain_summary)
+    niche_state_summary = _state_summary_section(niche_summary)
+    component_axis_order = [str(item.get("axis", "")) for item in (summary.get("component_axis_overview") or []) if item.get("axis")]
+    role_axis_order = [str(item.get("axis", "")) for item in (summary.get("role_axis_overview") or []) if item.get("axis")]
+    persistent_component_axes = [
+        axis_id
+        for axis_id in component_axis_order
+        if axis_id in set(program_state_summary.get("supported_component_axes", []))
+        and axis_id in set(domain_state_summary.get("supported_component_axes", []))
+        and axis_id in set(niche_state_summary.get("supported_component_axes", []))
+    ]
+    persistent_role_axes = [
+        axis_id
+        for axis_id in role_axis_order
+        if axis_id in set(program_state_summary.get("supported_role_axes", []))
+        and axis_id in set(domain_state_summary.get("supported_role_axes", []))
+        and axis_id in set(niche_state_summary.get("supported_role_axes", []))
+    ]
+    domain_confirmed_component_axes = [
+        axis_id
+        for axis_id in component_axis_order
+        if axis_id in set(program_state_summary.get("supported_component_axes", []))
+        and axis_id in set(domain_state_summary.get("supported_component_axes", []))
+    ]
+    domain_confirmed_role_axes = [
+        axis_id
+        for axis_id in role_axis_order
+        if axis_id in set(program_state_summary.get("supported_role_axes", []))
+        and axis_id in set(domain_state_summary.get("supported_role_axes", []))
+    ]
+    niche_amplified_component_axes = _shift_axes_between_layers(
+        domain_state_summary.get("component_axis_overview"),
+        niche_state_summary.get("component_axis_overview"),
+        component_axis_order,
+    )
+    niche_reorganized_role_axes = _shift_axes_between_layers(
+        domain_state_summary.get("role_axis_overview"),
+        niche_state_summary.get("role_axis_overview"),
+        role_axis_order,
+    )
     view = {
         "sample_id": summary.get("sample_id", ""),
         "cancer_type": summary.get("cancer_type", ""),
-        "dominant_backbone": dominant_component,
-        "secondary_emphasis": secondary_component,
-        "dominant_role_signature": dominant_role,
-        "secondary_role_signature": secondary_role,
+        "program_state_summary": program_state_summary,
+        "domain_state_summary": domain_state_summary,
+        "niche_state_summary": niche_state_summary,
         "reliability": {
             "summary_reliability_hint": summary.get("summary_reliability_hint", "NA"),
             "component_summary_reliability": summary.get("component_summary_reliability", "NA"),
         },
-        "cross_layer_summary": (
-            f"Current cross-layer summary is driven by Program-level Representation: dominant backbone "
-            f"`{(dominant_component or {}).get('axis', 'NA')}`, secondary emphasis "
-            f"`{(secondary_component or {}).get('axis', 'NA')}`."
-        ),
+        "cross_layer_state_summary": {
+            "persistent_component_axes": persistent_component_axes,
+            "persistent_role_axes": persistent_role_axes,
+            "domain_confirmed_component_axes": domain_confirmed_component_axes,
+            "domain_confirmed_role_axes": domain_confirmed_role_axes,
+            "niche_amplified_component_axes": niche_amplified_component_axes,
+            "niche_reorganized_role_axes": niche_reorganized_role_axes,
+            "summary_text": (
+                "Cross-layer continuity is defined by persistent supported axes, while downstream shifts are read as "
+                "changes in support configuration rather than category replacement."
+            ),
+        },
+        "state_shift_summary": {
+            "program_to_domain_component_shift_axes": _shift_axes_between_layers(
+                program_state_summary.get("component_axis_overview"),
+                domain_state_summary.get("component_axis_overview"),
+                component_axis_order,
+            ),
+            "program_to_domain_role_shift_axes": _shift_axes_between_layers(
+                program_state_summary.get("role_axis_overview"),
+                domain_state_summary.get("role_axis_overview"),
+                role_axis_order,
+            ),
+            "domain_to_niche_component_shift_axes": niche_amplified_component_axes,
+            "domain_to_niche_role_shift_axes": niche_reorganized_role_axes,
+            "summary_text": (
+                "State shift is summarized as layer-wise support changes: Domain confirms or suppresses Program-level "
+                "support, while Niche can further amplify or reorganize local component and role support."
+            ),
+        },
         "layer_status": {
             "program": "implemented",
             "domain": "implemented" if domain_summary else "not_implemented_yet",
@@ -2099,53 +2492,64 @@ def build_sample_summary_view(
     if program_comparability_summary:
         view["program_comparability_summary"] = {
             "nearest_comparable_samples": program_comparability_summary.get("nearest_comparable_samples", []),
-            "shared_dominant_component_tendencies": program_comparability_summary.get("shared_dominant_component_tendencies", []),
-            "shared_dominant_role_tendencies": program_comparability_summary.get("shared_dominant_role_tendencies", []),
-            "sample_specific_component_emphasis": program_comparability_summary.get("sample_specific_component_emphasis", []),
-            "sample_specific_role_emphasis": program_comparability_summary.get("sample_specific_role_emphasis", []),
+            "shared_component_support_tendencies": program_comparability_summary.get("shared_component_support_tendencies", []),
+            "shared_role_support_tendencies": program_comparability_summary.get("shared_role_support_tendencies", []),
+            "sample_specific_component_support_patterns": program_comparability_summary.get("sample_specific_component_support_patterns", []),
+            "sample_specific_role_support_patterns": program_comparability_summary.get("sample_specific_role_support_patterns", []),
+            "nearest_comparable_state_profiles": [
+                {
+                    "sample_id": item.get("sample_id", ""),
+                    "comparability_score": item.get("comparability_score", 0.0),
+                    "leading_component_anchor": item.get("leading_component_anchor", ""),
+                    "leading_role_anchor": item.get("leading_role_anchor", ""),
+                }
+                for item in program_comparability_summary.get("nearest_comparable_samples", [])
+            ],
             "comparability_reliability_hint": program_comparability_summary.get("comparability_reliability_hint", "NA"),
             "top_comparable_program_pairs": program_comparability_summary.get("top_comparable_program_pairs", []),
         }
         view["program_comparability_ref"] = "program/cross_sample_summary.json"
     if domain_summary:
-        view["domain_level_summary"] = {
-            "dominant_component": domain_summary.get("dominant_component"),
-            "secondary_component": domain_summary.get("secondary_component"),
-            "dominant_role": domain_summary.get("dominant_role"),
-            "secondary_role": domain_summary.get("secondary_role"),
-            "summary_reliability_hint": domain_summary.get("summary_reliability_hint", "NA"),
-            "representative_domains": domain_summary.get("representative_domains", []),
-        }
         view["domain_summary_ref"] = "domain/macro_summary.json"
     if domain_comparability_summary:
         view["domain_comparability_summary"] = {
             "nearest_comparable_samples": domain_comparability_summary.get("nearest_comparable_samples", []),
-            "shared_dominant_component_tendencies": domain_comparability_summary.get("shared_dominant_component_tendencies", []),
-            "shared_dominant_role_tendencies": domain_comparability_summary.get("shared_dominant_role_tendencies", []),
-            "sample_specific_component_emphasis": domain_comparability_summary.get("sample_specific_component_emphasis", []),
-            "sample_specific_role_emphasis": domain_comparability_summary.get("sample_specific_role_emphasis", []),
+            "shared_component_support_tendencies": domain_comparability_summary.get("shared_component_support_tendencies", []),
+            "shared_role_support_tendencies": domain_comparability_summary.get("shared_role_support_tendencies", []),
+            "sample_specific_component_support_patterns": domain_comparability_summary.get("sample_specific_component_support_patterns", []),
+            "sample_specific_role_support_patterns": domain_comparability_summary.get("sample_specific_role_support_patterns", []),
+            "nearest_comparable_state_profiles": [
+                {
+                    "sample_id": item.get("sample_id", ""),
+                    "comparability_score": item.get("comparability_score", 0.0),
+                    "leading_component_anchor": item.get("leading_component_anchor", ""),
+                    "leading_role_anchor": item.get("leading_role_anchor", ""),
+                }
+                for item in domain_comparability_summary.get("nearest_comparable_samples", [])
+            ],
             "comparability_reliability_hint": domain_comparability_summary.get("comparability_reliability_hint", "NA"),
             "top_comparable_domain_pairs": domain_comparability_summary.get("top_comparable_domain_pairs", []),
         }
         view["domain_comparability_ref"] = "domain/cross_sample_summary.json"
     if niche_summary:
         view["layer_status"]["niche"] = "implemented"
-        view["niche_level_summary"] = {
-            "dominant_component_mix": niche_summary.get("dominant_component_mix"),
-            "secondary_component_mix": niche_summary.get("secondary_component_mix"),
-            "dominant_role_mix": niche_summary.get("dominant_role_mix"),
-            "secondary_role_mix": niche_summary.get("secondary_role_mix"),
-            "summary_reliability_hint": niche_summary.get("summary_reliability_hint", "NA"),
-            "representative_niches": niche_summary.get("representative_niches", []),
-        }
         view["niche_summary_ref"] = "niche/macro_summary.json"
     if niche_comparability_summary:
         view["niche_comparability_summary"] = {
             "nearest_comparable_samples": niche_comparability_summary.get("nearest_comparable_samples", []),
-            "shared_dominant_component_tendencies": niche_comparability_summary.get("shared_dominant_component_tendencies", []),
-            "shared_dominant_role_tendencies": niche_comparability_summary.get("shared_dominant_role_tendencies", []),
-            "sample_specific_component_emphasis": niche_comparability_summary.get("sample_specific_component_emphasis", []),
-            "sample_specific_role_emphasis": niche_comparability_summary.get("sample_specific_role_emphasis", []),
+            "shared_component_support_tendencies": niche_comparability_summary.get("shared_component_support_tendencies", []),
+            "shared_role_support_tendencies": niche_comparability_summary.get("shared_role_support_tendencies", []),
+            "sample_specific_component_support_patterns": niche_comparability_summary.get("sample_specific_component_support_patterns", []),
+            "sample_specific_role_support_patterns": niche_comparability_summary.get("sample_specific_role_support_patterns", []),
+            "nearest_comparable_state_profiles": [
+                {
+                    "sample_id": item.get("sample_id", ""),
+                    "comparability_score": item.get("comparability_score", 0.0),
+                    "leading_component_anchor": item.get("leading_component_anchor", ""),
+                    "leading_role_anchor": item.get("leading_role_anchor", ""),
+                }
+                for item in niche_comparability_summary.get("nearest_comparable_samples", [])
+            ],
             "comparability_reliability_hint": niche_comparability_summary.get("comparability_reliability_hint", "NA"),
             "top_comparable_niche_pairs": niche_comparability_summary.get("top_comparable_niche_pairs", []),
         }
@@ -2154,40 +2558,48 @@ def build_sample_summary_view(
 
 
 def build_sample_summary_markdown(sample_summary: dict) -> str:
-    dominant_backbone = sample_summary.get("dominant_backbone") or {}
-    secondary_emphasis = sample_summary.get("secondary_emphasis") or {}
-    dominant_role = sample_summary.get("dominant_role_signature") or {}
-    secondary_role = sample_summary.get("secondary_role_signature") or {}
+    program_state = sample_summary.get("program_state_summary") or {}
+    domain_state = sample_summary.get("domain_state_summary") or {}
+    niche_state = sample_summary.get("niche_state_summary") or {}
     reliability = sample_summary.get("reliability") or {}
     lines = [
         "# Sample Macro Summary",
         "",
         f"- sample_id: `{sample_summary.get('sample_id', '')}`",
         f"- cancer_type: `{sample_summary.get('cancer_type', '')}`",
-        f"- dominant backbone: `{dominant_backbone.get('axis', 'NA')}`",
-        f"- secondary emphasis: `{secondary_emphasis.get('axis', 'NA')}`",
-        f"- dominant role: `{dominant_role.get('axis', 'NA')}`",
-        f"- secondary role: `{secondary_role.get('axis', 'NA')}`",
+        f"- program leading component anchor: `{program_state.get('leading_component_anchor', 'NA') or 'NA'}`",
+        f"- program supported component axes: `{', '.join(program_state.get('supported_component_axes', [])) if program_state.get('supported_component_axes') else 'NA'}`",
+        f"- program leading role anchor: `{program_state.get('leading_role_anchor', 'NA') or 'NA'}`",
+        f"- program supported role axes: `{', '.join(program_state.get('supported_role_axes', [])) if program_state.get('supported_role_axes') else 'NA'}`",
         f"- summary_reliability_hint: `{reliability.get('summary_reliability_hint', 'NA')}`",
         f"- component_summary_reliability: `{reliability.get('component_summary_reliability', 'NA')}`",
         "",
-        "## Cross-Layer Summary",
+        "## Cross-Layer State Summary",
         "",
-        sample_summary.get("cross_layer_summary", ""),
+        (sample_summary.get("cross_layer_state_summary") or {}).get("summary_text", ""),
         "",
     ]
+    if sample_summary.get("state_shift_summary"):
+        lines.extend(
+            [
+                "## State Shift Summary",
+                "",
+                (sample_summary.get("state_shift_summary") or {}).get("summary_text", ""),
+                "",
+            ]
+        )
     if sample_summary.get("program_comparability_summary"):
         program_comp = sample_summary.get("program_comparability_summary") or {}
         nearest_samples = [item.get("sample_id", "") for item in (program_comp.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-        shared_components = [item.get("axis", "") for item in (program_comp.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-        shared_roles = [item.get("axis", "") for item in (program_comp.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
+        shared_components = [item.get("axis", "") for item in (program_comp.get("shared_component_support_tendencies") or []) if item.get("axis")]
+        shared_roles = [item.get("axis", "") for item in (program_comp.get("shared_role_support_tendencies") or []) if item.get("axis")]
         lines.extend(
             [
                 "## Program Comparability",
                 "",
                 f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-                f"- shared component tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
-                f"- shared role tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+                f"- shared component support tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
+                f"- shared role support tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
                 f"- comparability_reliability_hint: `{program_comp.get('comparability_reliability_hint', 'NA')}`",
                 "",
             ]
@@ -2195,46 +2607,44 @@ def build_sample_summary_markdown(sample_summary: dict) -> str:
     if sample_summary.get("domain_comparability_summary"):
         domain_comp = sample_summary.get("domain_comparability_summary") or {}
         nearest_samples = [item.get("sample_id", "") for item in (domain_comp.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-        shared_components = [item.get("axis", "") for item in (domain_comp.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-        shared_roles = [item.get("axis", "") for item in (domain_comp.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
+        shared_components = [item.get("axis", "") for item in (domain_comp.get("shared_component_support_tendencies") or []) if item.get("axis")]
+        shared_roles = [item.get("axis", "") for item in (domain_comp.get("shared_role_support_tendencies") or []) if item.get("axis")]
         lines.extend(
             [
                 "## Domain Comparability",
                 "",
                 f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-                f"- shared component tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
-                f"- shared role tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+                f"- shared component support tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
+                f"- shared role support tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
                 f"- comparability_reliability_hint: `{domain_comp.get('comparability_reliability_hint', 'NA')}`",
                 "",
             ]
         )
-    if sample_summary.get("domain_level_summary"):
-        domain_section = sample_summary.get("domain_level_summary") or {}
+    if domain_state:
         lines.extend(
             [
                 "## Domain-Level Summary",
                 "",
-                f"- dominant component: `{((domain_section.get('dominant_component') or {}).get('axis', 'NA'))}`",
-                f"- secondary component: `{((domain_section.get('secondary_component') or {}).get('axis', 'NA'))}`",
-                f"- dominant role: `{((domain_section.get('dominant_role') or {}).get('axis', 'NA'))}`",
-                f"- secondary role: `{((domain_section.get('secondary_role') or {}).get('axis', 'NA'))}`",
-                f"- summary_reliability_hint: `{domain_section.get('summary_reliability_hint', 'NA')}`",
+                f"- leading component anchor: `{domain_state.get('leading_component_anchor', 'NA') or 'NA'}`",
+                f"- supported component axes: `{', '.join(domain_state.get('supported_component_axes', [])) if domain_state.get('supported_component_axes') else 'NA'}`",
+                f"- leading role anchor: `{domain_state.get('leading_role_anchor', 'NA') or 'NA'}`",
+                f"- supported role axes: `{', '.join(domain_state.get('supported_role_axes', [])) if domain_state.get('supported_role_axes') else 'NA'}`",
+                f"- summary_reliability_hint: `{domain_state.get('summary_reliability_hint', 'NA')}`",
                 "",
             ]
         )
     else:
         lines.append("- Domain-level: not implemented yet")
-    if sample_summary.get("niche_level_summary"):
-        niche_section = sample_summary.get("niche_level_summary") or {}
+    if niche_state:
         lines.extend(
             [
                 "## Niche-Level Summary",
                 "",
-                f"- dominant component composition: `{((niche_section.get('dominant_component_mix') or {}).get('axis', 'NA'))}`",
-                f"- secondary component composition: `{((niche_section.get('secondary_component_mix') or {}).get('axis', 'NA'))}`",
-                f"- dominant role composition: `{((niche_section.get('dominant_role_mix') or {}).get('axis', 'NA'))}`",
-                f"- secondary role composition: `{((niche_section.get('secondary_role_mix') or {}).get('axis', 'NA'))}`",
-                f"- summary_reliability_hint: `{niche_section.get('summary_reliability_hint', 'NA')}`",
+                f"- leading component anchor: `{niche_state.get('leading_component_anchor', 'NA') or 'NA'}`",
+                f"- supported component axes: `{', '.join(niche_state.get('supported_component_axes', [])) if niche_state.get('supported_component_axes') else 'NA'}`",
+                f"- leading role anchor: `{niche_state.get('leading_role_anchor', 'NA') or 'NA'}`",
+                f"- supported role axes: `{', '.join(niche_state.get('supported_role_axes', [])) if niche_state.get('supported_role_axes') else 'NA'}`",
+                f"- summary_reliability_hint: `{niche_state.get('summary_reliability_hint', 'NA')}`",
                 "",
             ]
         )
@@ -2243,15 +2653,15 @@ def build_sample_summary_markdown(sample_summary: dict) -> str:
     if sample_summary.get("niche_comparability_summary"):
         niche_comp = sample_summary.get("niche_comparability_summary") or {}
         nearest_samples = [item.get("sample_id", "") for item in (niche_comp.get("nearest_comparable_samples") or []) if item.get("sample_id")]
-        shared_components = [item.get("axis", "") for item in (niche_comp.get("shared_dominant_component_tendencies") or []) if item.get("axis")]
-        shared_roles = [item.get("axis", "") for item in (niche_comp.get("shared_dominant_role_tendencies") or []) if item.get("axis")]
+        shared_components = [item.get("axis", "") for item in (niche_comp.get("shared_component_support_tendencies") or []) if item.get("axis")]
+        shared_roles = [item.get("axis", "") for item in (niche_comp.get("shared_role_support_tendencies") or []) if item.get("axis")]
         lines.extend(
             [
                 "## Niche Comparability",
                 "",
                 f"- nearest comparable samples: `{', '.join(nearest_samples) if nearest_samples else 'NA'}`",
-                f"- shared component tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
-                f"- shared role tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
+                f"- shared component support tendencies: `{', '.join(shared_components) if shared_components else 'NA'}`",
+                f"- shared role support tendencies: `{', '.join(shared_roles) if shared_roles else 'NA'}`",
                 f"- comparability_reliability_hint: `{niche_comp.get('comparability_reliability_hint', 'NA')}`",
                 "",
             ]
@@ -2469,8 +2879,12 @@ def build_domain_burden_table(
         for axis_id in [*component_ids, *role_ids]:
             row[f"{axis_id}_raw_burden"] = 0.0
             row[f"{axis_id}_confidence_weighted_burden"] = 0.0
-        row["dominant_component_by_burden"] = ""
-        row["dominant_role_by_burden"] = ""
+        row["supported_component_axes"] = ""
+        row["supported_role_axes"] = ""
+        row["component_support_spread"] = 0.0
+        row["role_support_spread"] = 0.0
+        row["component_burden_profile"] = "[]"
+        row["role_burden_profile"] = "[]"
         return pd.DataFrame([row])
     eligible["raw_weight_base"] = pd.to_numeric(eligible.get("spot_count", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     eligible["confidence_weight_base"] = eligible["raw_weight_base"] * pd.to_numeric(
@@ -2496,12 +2910,46 @@ def build_domain_burden_table(
         rep_count = int(((eligible[axis_id] >= float(cfg.scoring.supported_axis_score_threshold)) & (eligible["domain_level_confidence"] >= float(cfg.scoring.representative_program_min_confidence))).sum())
         row[f"{axis_id}_representative_domain_count"] = rep_count
         role_burdens[axis_id] = float(row[f"{axis_id}_confidence_weighted_burden"])
-    comp_order = [axis_id for axis_id, _ in sorted(comp_burdens.items(), key=lambda x: (-x[1], x[0]))]
-    role_order = [axis_id for axis_id, _ in sorted(role_burdens.items(), key=lambda x: (-x[1], x[0]))]
-    row["dominant_component_by_burden"] = comp_order[0] if comp_order else ""
-    row["dominant_role_by_burden"] = role_order[0] if role_order else ""
-    row["secondary_component_by_burden"] = comp_order[1] if len(comp_order) > 1 else ""
-    row["secondary_role_by_burden"] = role_order[1] if len(role_order) > 1 else ""
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    row["supported_component_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(component_ids, comp_burdens, component_threshold)
+    )
+    row["supported_role_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(role_ids, role_burdens, role_threshold)
+    )
+    row["component_support_spread"] = _axis_support_spread(component_ids, comp_burdens)
+    row["role_support_spread"] = _axis_support_spread(role_ids, role_burdens)
+    row["component_burden_profile"] = _overview_json_snapshot(
+        _axis_overview_entries(
+            axis_ids=component_ids,
+            score_map=comp_burdens,
+            threshold=component_threshold,
+            extra_map={
+                axis_id: {
+                    "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                    "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                    "representative_domain_count": int(row.get(f"{axis_id}_representative_domain_count", 0)),
+                }
+                for axis_id in component_ids
+            },
+        )
+    )
+    row["role_burden_profile"] = _overview_json_snapshot(
+        _axis_overview_entries(
+            axis_ids=role_ids,
+            score_map=role_burdens,
+            threshold=role_threshold,
+            extra_map={
+                axis_id: {
+                    "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                    "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                    "representative_domain_count": int(row.get(f"{axis_id}_representative_domain_count", 0)),
+                }
+                for axis_id in role_ids
+            },
+        )
+    )
     return pd.DataFrame([row])
 
 
@@ -2521,21 +2969,31 @@ def build_domain_summary_payload(
         return {
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
-            "dominant_component": None,
-            "secondary_component": None,
-            "dominant_role": None,
-            "secondary_role": None,
+            "leading_component_anchor": None,
+            "leading_role_anchor": None,
+            "supported_component_axes": [],
+            "supported_role_axes": [],
+            "component_axis_overview": [],
+            "role_axis_overview": [],
+            "component_support_profile": {},
+            "role_support_profile": {},
+            "component_support_spread": 0.0,
+            "role_support_spread": 0.0,
+            "component_state_type": "diffuse_low_support",
+            "role_state_type": "diffuse_low_support",
+            "component_state_summary": "Component support remains broad but weak, without a strongly consolidated axis.",
+            "role_state_summary": "Role support remains broad but weak, without a strongly consolidated axis.",
             "representative_domains": [],
             "summary_reliability_hint": "low",
         }
-    comp_order = [axis_id for axis_id, _ in sorted(
-        {axis_id: float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)) for axis_id in component_ids}.items(),
-        key=lambda x: (-x[1], x[0]),
-    )]
-    role_order = [axis_id for axis_id, _ in sorted(
-        {axis_id: float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)) for axis_id in role_ids}.items(),
-        key=lambda x: (-x[1], x[0]),
-    )]
+    component_score_map = _score_map_from_row(burden_row, component_ids)
+    role_score_map = _score_map_from_row(burden_row, role_ids)
+    comp_order = [axis_id for axis_id, _ in sorted(component_score_map.items(), key=lambda x: (-x[1], x[0]))]
+    role_order = [axis_id for axis_id, _ in sorted(role_score_map.items(), key=lambda x: (-x[1], x[0]))]
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    supported_component_axes = _supported_axes_in_fixed_order(component_ids, component_score_map, component_threshold)
+    supported_role_axes = _supported_axes_in_fixed_order(role_ids, role_score_map, role_threshold)
     reps = eligible.sort_values(["spot_count", "domain_level_confidence", "domain_id"], ascending=[False, False, True]).head(max(3, int(cfg.scoring.top_programs_per_axis)))
     representative_domains = [
         {
@@ -2549,19 +3007,80 @@ def build_domain_summary_payload(
         for _, r in reps.iterrows()
     ]
     reliability = "high" if int(eligible.shape[0]) >= 6 else "medium" if int(eligible.shape[0]) >= 3 else "low"
+    component_support_spread = _axis_support_spread(component_ids, component_score_map)
+    role_support_spread = _axis_support_spread(role_ids, role_score_map)
+    component_axis_overview = _axis_overview_entries(
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        threshold=component_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representative_domain_count": int(burden_row.get(f"{axis_id}_representative_domain_count", 0)),
+            }
+            for axis_id in component_ids
+        },
+    )
+    role_axis_overview = _axis_overview_entries(
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        threshold=role_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representative_domain_count": int(burden_row.get(f"{axis_id}_representative_domain_count", 0)),
+            }
+            for axis_id in role_ids
+        },
+    )
+    component_profile = _build_support_profile(
+        axis_label="component",
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        leading_anchor=comp_order[0] if comp_order else None,
+        supported_axes=supported_component_axes,
+        support_spread=component_support_spread,
+        cfg=cfg,
+        threshold=component_threshold,
+    )
+    role_profile = _build_support_profile(
+        axis_label="role",
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        leading_anchor=role_order[0] if role_order else None,
+        supported_axes=supported_role_axes,
+        support_spread=role_support_spread,
+        cfg=cfg,
+        threshold=role_threshold,
+    )
     return {
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
-        "dominant_component": _signature_record(burden_row, comp_order[0] if comp_order else None),
-        "secondary_component": _signature_record(burden_row, comp_order[1] if len(comp_order) > 1 else None),
-        "dominant_role": _signature_record(burden_row, role_order[0] if role_order else None),
-        "secondary_role": _signature_record(burden_row, role_order[1] if len(role_order) > 1 else None),
+        "leading_component_anchor": comp_order[0] if comp_order else None,
+        "leading_role_anchor": role_order[0] if role_order else None,
+        "supported_component_axes": supported_component_axes,
+        "supported_role_axes": supported_role_axes,
+        "component_axis_overview": component_axis_overview,
+        "role_axis_overview": role_axis_overview,
+        "component_support_profile": component_profile,
+        "role_support_profile": role_profile,
+        "component_support_spread": float(component_support_spread),
+        "role_support_spread": float(role_support_spread),
+        "component_state_type": str(component_profile["state_type"]),
+        "role_state_type": str(role_profile["state_type"]),
+        "component_state_summary": str(component_profile["summary_text"]),
+        "role_state_summary": str(role_profile["summary_text"]),
         "representative_domains": representative_domains,
         "summary_reliability_hint": reliability,
-        "structured_overview": (
-            f"Domain-level macro portrait is centered on `{comp_order[0] if comp_order else 'NA'}` domains with "
-            f"`{role_order[0] if role_order else 'NA'}` as the dominant spatial role."
-        ),
+        "structured_overview": f"{component_profile['summary_text']} {role_profile['summary_text']}",
+        "deprecated_internal_fields": {
+            "internal_summary_anchor": True,
+            "deprecated_primary_narrative_field": True,
+            "dominant_component": _signature_record(burden_row, comp_order[0] if comp_order else None),
+            "dominant_role": _signature_record(burden_row, role_order[0] if role_order else None),
+        },
     }
 
 
@@ -2571,10 +3090,12 @@ def build_domain_summary_markdown(summary: dict) -> str:
         "# Domain Macro Summary\n\n"
         f"- sample_id: `{summary.get('sample_id', '')}`\n"
         f"- cancer_type: `{summary.get('cancer_type', '')}`\n"
-        f"- Domain-level dominant component: `{((summary.get('dominant_component') or {}).get('axis', 'NA'))}`\n"
-        f"- Domain-level secondary component: `{((summary.get('secondary_component') or {}).get('axis', 'NA'))}`\n"
-        f"- Domain-level dominant role: `{((summary.get('dominant_role') or {}).get('axis', 'NA'))}`\n"
-        f"- Domain-level secondary role: `{((summary.get('secondary_role') or {}).get('axis', 'NA'))}`\n"
+        f"- leading_component_anchor: `{summary.get('leading_component_anchor', 'NA') or 'NA'}`\n"
+        f"- supported_component_axes: `{', '.join(summary.get('supported_component_axes', [])) if summary.get('supported_component_axes') else 'NA'}`\n"
+        f"- component_state_type: `{summary.get('component_state_type', 'NA')}`\n"
+        f"- leading_role_anchor: `{summary.get('leading_role_anchor', 'NA') or 'NA'}`\n"
+        f"- supported_role_axes: `{', '.join(summary.get('supported_role_axes', [])) if summary.get('supported_role_axes') else 'NA'}`\n"
+        f"- role_state_type: `{summary.get('role_state_type', 'NA')}`\n"
         f"- representative domains: `{reps}`\n"
         f"- summary_reliability_hint: `{summary.get('summary_reliability_hint', 'NA')}`\n\n"
         "## Structured Overview\n\n"
@@ -2780,8 +3301,12 @@ def build_niche_burden_table(
         for axis_id in [*component_ids, *role_ids]:
             row[f"{axis_id}_raw_burden"] = 0.0
             row[f"{axis_id}_confidence_weighted_burden"] = 0.0
-        row["dominant_component_by_burden"] = ""
-        row["dominant_role_by_burden"] = ""
+        row["supported_component_axes"] = ""
+        row["supported_role_axes"] = ""
+        row["component_support_spread"] = 0.0
+        row["role_support_spread"] = 0.0
+        row["component_burden_profile"] = "[]"
+        row["role_burden_profile"] = "[]"
         return pd.DataFrame([row])
     eligible["raw_weight_base"] = pd.to_numeric(eligible.get("niche_member_count", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     eligible["confidence_weight_base"] = eligible["raw_weight_base"] * pd.to_numeric(eligible.get("niche_confidence", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
@@ -2803,12 +3328,50 @@ def build_niche_burden_table(
         row[f"{axis_id}_confidence_weighted_burden"] = float((eligible["confidence_weight"] * eligible[axis_id]).sum())
         row[f"{axis_id}_representative_niche_count"] = int(((eligible[axis_id] >= float(cfg.scoring.supported_axis_score_threshold)) & (eligible["niche_confidence"] >= float(cfg.scoring.representative_program_min_confidence))).sum())
         role_burdens[axis_id] = float(row[f"{axis_id}_confidence_weighted_burden"])
-    comp_order = [axis_id for axis_id, _ in sorted(comp_burdens.items(), key=lambda x: (-x[1], x[0]))]
-    role_order = [axis_id for axis_id, _ in sorted(role_burdens.items(), key=lambda x: (-x[1], x[0]))]
-    row["dominant_component_by_burden"] = comp_order[0] if comp_order else ""
-    row["secondary_component_by_burden"] = comp_order[1] if len(comp_order) > 1 else ""
-    row["dominant_role_by_burden"] = role_order[0] if role_order else ""
-    row["secondary_role_by_burden"] = role_order[1] if len(role_order) > 1 else ""
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    row["supported_component_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(component_ids, comp_burdens, component_threshold)
+    )
+    row["supported_role_axes"] = _pipe_join(
+        _supported_axes_in_fixed_order(role_ids, role_burdens, role_threshold)
+    )
+    row["component_support_spread"] = float(
+        pd.to_numeric(eligible.get("component_mix_diversity", 0.0), errors="coerce").fillna(0.0).mean()
+    ) if not eligible.empty else 0.0
+    row["role_support_spread"] = float(
+        pd.to_numeric(eligible.get("role_mix_diversity", 0.0), errors="coerce").fillna(0.0).mean()
+    ) if not eligible.empty else 0.0
+    row["component_burden_profile"] = _overview_json_snapshot(
+        _axis_overview_entries(
+            axis_ids=component_ids,
+            score_map=comp_burdens,
+            threshold=component_threshold,
+            extra_map={
+                axis_id: {
+                    "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                    "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                    "representative_niche_count": int(row.get(f"{axis_id}_representative_niche_count", 0)),
+                }
+                for axis_id in component_ids
+            },
+        )
+    )
+    row["role_burden_profile"] = _overview_json_snapshot(
+        _axis_overview_entries(
+            axis_ids=role_ids,
+            score_map=role_burdens,
+            threshold=role_threshold,
+            extra_map={
+                axis_id: {
+                    "raw_burden": float(row.get(f"{axis_id}_raw_burden", 0.0)),
+                    "confidence_weighted_burden": float(row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                    "representative_niche_count": int(row.get(f"{axis_id}_representative_niche_count", 0)),
+                }
+                for axis_id in role_ids
+            },
+        )
+    )
     return pd.DataFrame([row])
 
 
@@ -2828,21 +3391,31 @@ def build_niche_summary_payload(
         return {
             "sample_id": bundle.sample_id,
             "cancer_type": bundle.cancer_type,
-            "dominant_component_mix": None,
-            "secondary_component_mix": None,
-            "dominant_role_mix": None,
-            "secondary_role_mix": None,
+            "leading_component_anchor": None,
+            "leading_role_anchor": None,
+            "supported_component_axes": [],
+            "supported_role_axes": [],
+            "component_axis_overview": [],
+            "role_axis_overview": [],
+            "component_support_profile": {},
+            "role_support_profile": {},
+            "component_support_spread": 0.0,
+            "role_support_spread": 0.0,
+            "component_state_type": "diffuse_low_support",
+            "role_state_type": "diffuse_low_support",
+            "component_state_summary": "Component support remains broad but weak, without a strongly consolidated axis.",
+            "role_state_summary": "Role support remains broad but weak, without a strongly consolidated axis.",
             "representative_niches": [],
             "summary_reliability_hint": "low",
         }
-    comp_order = [axis_id for axis_id, _ in sorted(
-        {axis_id: float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)) for axis_id in component_ids}.items(),
-        key=lambda x: (-x[1], x[0]),
-    )]
-    role_order = [axis_id for axis_id, _ in sorted(
-        {axis_id: float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)) for axis_id in role_ids}.items(),
-        key=lambda x: (-x[1], x[0]),
-    )]
+    component_score_map = _score_map_from_row(burden_row, component_ids)
+    role_score_map = _score_map_from_row(burden_row, role_ids)
+    comp_order = [axis_id for axis_id, _ in sorted(component_score_map.items(), key=lambda x: (-x[1], x[0]))]
+    role_order = [axis_id for axis_id, _ in sorted(role_score_map.items(), key=lambda x: (-x[1], x[0]))]
+    component_threshold = _supported_axis_threshold(cfg, "component")
+    role_threshold = _supported_axis_threshold(cfg, "role")
+    supported_component_axes = _supported_axes_in_fixed_order(component_ids, component_score_map, component_threshold)
+    supported_role_axes = _supported_axes_in_fixed_order(role_ids, role_score_map, role_threshold)
     reps = eligible.sort_values(["niche_member_count", "niche_confidence", "niche_id"], ascending=[False, False, True]).head(max(3, int(cfg.scoring.top_programs_per_axis)))
     representative_niches = [
         {
@@ -2855,19 +3428,96 @@ def build_niche_summary_payload(
         for _, r in reps.iterrows()
     ]
     reliability = "high" if int(eligible.shape[0]) >= 8 else "medium" if int(eligible.shape[0]) >= 4 else "low"
+    weight = (
+        pd.to_numeric(eligible.get("niche_member_count", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+        * pd.to_numeric(eligible.get("niche_confidence", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
+    )
+    if float(weight.sum()) <= 0.0:
+        weight = pd.Series(np.ones(len(eligible), dtype=float), index=eligible.index)
+    component_support_spread = float(
+        np.average(
+            pd.to_numeric(eligible.get("component_mix_diversity", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float),
+            weights=weight.to_numpy(dtype=float),
+        )
+    )
+    role_support_spread = float(
+        np.average(
+            pd.to_numeric(eligible.get("role_mix_diversity", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=float),
+            weights=weight.to_numpy(dtype=float),
+        )
+    )
+    component_axis_overview = _axis_overview_entries(
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        threshold=component_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representative_niche_count": int(burden_row.get(f"{axis_id}_representative_niche_count", 0)),
+            }
+            for axis_id in component_ids
+        },
+    )
+    role_axis_overview = _axis_overview_entries(
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        threshold=role_threshold,
+        extra_map={
+            axis_id: {
+                "raw_burden": float(burden_row.get(f"{axis_id}_raw_burden", 0.0)),
+                "confidence_weighted_burden": float(burden_row.get(f"{axis_id}_confidence_weighted_burden", 0.0)),
+                "representative_niche_count": int(burden_row.get(f"{axis_id}_representative_niche_count", 0)),
+            }
+            for axis_id in role_ids
+        },
+    )
+    component_profile = _build_support_profile(
+        axis_label="component",
+        axis_ids=component_ids,
+        score_map=component_score_map,
+        leading_anchor=comp_order[0] if comp_order else None,
+        supported_axes=supported_component_axes,
+        support_spread=component_support_spread,
+        cfg=cfg,
+        threshold=component_threshold,
+    )
+    role_profile = _build_support_profile(
+        axis_label="role",
+        axis_ids=role_ids,
+        score_map=role_score_map,
+        leading_anchor=role_order[0] if role_order else None,
+        supported_axes=supported_role_axes,
+        support_spread=role_support_spread,
+        cfg=cfg,
+        threshold=role_threshold,
+    )
     return {
         "sample_id": bundle.sample_id,
         "cancer_type": bundle.cancer_type,
-        "dominant_component_mix": _signature_record(burden_row, comp_order[0] if comp_order else None),
-        "secondary_component_mix": _signature_record(burden_row, comp_order[1] if len(comp_order) > 1 else None),
-        "dominant_role_mix": _signature_record(burden_row, role_order[0] if role_order else None),
-        "secondary_role_mix": _signature_record(burden_row, role_order[1] if len(role_order) > 1 else None),
+        "leading_component_anchor": comp_order[0] if comp_order else None,
+        "leading_role_anchor": role_order[0] if role_order else None,
+        "supported_component_axes": supported_component_axes,
+        "supported_role_axes": supported_role_axes,
+        "component_axis_overview": component_axis_overview,
+        "role_axis_overview": role_axis_overview,
+        "component_support_profile": component_profile,
+        "role_support_profile": role_profile,
+        "component_support_spread": float(component_support_spread),
+        "role_support_spread": float(role_support_spread),
+        "component_state_type": str(component_profile["state_type"]),
+        "role_state_type": str(role_profile["state_type"]),
+        "component_state_summary": str(component_profile["summary_text"]),
+        "role_state_summary": str(role_profile["summary_text"]),
         "representative_niches": representative_niches,
         "summary_reliability_hint": reliability,
-        "structured_overview": (
-            f"Niche-level macro portrait is centered on `{comp_order[0] if comp_order else 'NA'}` composition with "
-            f"`{role_order[0] if role_order else 'NA'}` as the dominant role mix."
-        ),
+        "structured_overview": f"{component_profile['summary_text']} {role_profile['summary_text']}",
+        "deprecated_internal_fields": {
+            "internal_summary_anchor": True,
+            "deprecated_primary_narrative_field": True,
+            "dominant_component_mix": _signature_record(burden_row, comp_order[0] if comp_order else None),
+            "dominant_role_mix": _signature_record(burden_row, role_order[0] if role_order else None),
+        },
     }
 
 
@@ -2877,10 +3527,12 @@ def build_niche_summary_markdown(summary: dict) -> str:
         "# Niche Macro Summary\n\n"
         f"- sample_id: `{summary.get('sample_id', '')}`\n"
         f"- cancer_type: `{summary.get('cancer_type', '')}`\n"
-        f"- dominant niche component composition: `{((summary.get('dominant_component_mix') or {}).get('axis', 'NA'))}`\n"
-        f"- secondary niche component composition: `{((summary.get('secondary_component_mix') or {}).get('axis', 'NA'))}`\n"
-        f"- dominant niche role composition: `{((summary.get('dominant_role_mix') or {}).get('axis', 'NA'))}`\n"
-        f"- secondary niche role composition: `{((summary.get('secondary_role_mix') or {}).get('axis', 'NA'))}`\n"
+        f"- leading_component_anchor: `{summary.get('leading_component_anchor', 'NA') or 'NA'}`\n"
+        f"- supported_component_axes: `{', '.join(summary.get('supported_component_axes', [])) if summary.get('supported_component_axes') else 'NA'}`\n"
+        f"- component_state_type: `{summary.get('component_state_type', 'NA')}`\n"
+        f"- leading_role_anchor: `{summary.get('leading_role_anchor', 'NA') or 'NA'}`\n"
+        f"- supported_role_axes: `{', '.join(summary.get('supported_role_axes', [])) if summary.get('supported_role_axes') else 'NA'}`\n"
+        f"- role_state_type: `{summary.get('role_state_type', 'NA')}`\n"
         f"- representative niches: `{reps}`\n"
         f"- summary_reliability_hint: `{summary.get('summary_reliability_hint', 'NA')}`\n\n"
         "## Structured Overview\n\n"

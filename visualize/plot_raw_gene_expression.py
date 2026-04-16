@@ -29,7 +29,7 @@ DEFAULT_RESULTS_ROOT = Path("/Users/wuyang/Documents/gsNiche典型结果/results
 DEFAULT_H5AD_ROOT = Path("/Users/wuyang/Documents/SC-ST data")
 DEFAULT_CANCER = "COAD"
 DEFAULT_SAMPLE = "TENX89"
-DEFAULT_GENES = ["COMP", "COL11A1", "IL6", "CXCL5"]
+DEFAULT_GENES = ["PLA2G2A ", "TNXB", "CXCL12", "SCARA5"]
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "raw_gene_expression"
 
 

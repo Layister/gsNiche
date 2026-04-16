@@ -145,6 +145,19 @@ class RepresentationScoringConfig:
 
 
 @dataclass
+class RepresentationSummaryConfig:
+    supported_axis_threshold_component: float = 0.15
+    supported_axis_threshold_role: float = 0.15
+    focused_support_spread_max: float = 0.35
+    mixed_support_spread_min: float = 0.62
+    focused_leading_margin_min: float = 0.10
+    diffuse_support_score_max: float = 0.18
+    state_type_contract: str = "explicit_fixed_rules"
+    state_summary_contract: str = "state_type_template_based_not_rank_rephrased"
+    focused_summary_style: str = "concentrated_support_not_identity_label"
+
+
+@dataclass
 class RepresentationPipelineConfig:
     schema_version: str = "representationbundle.v1"
     code_version_override: Optional[str] = None
@@ -152,6 +165,7 @@ class RepresentationPipelineConfig:
     input: RepresentationInputConfig = field(default_factory=RepresentationInputConfig)
     eligibility: RepresentationEligibilityConfig = field(default_factory=RepresentationEligibilityConfig)
     scoring: RepresentationScoringConfig = field(default_factory=RepresentationScoringConfig)
+    summary: RepresentationSummaryConfig = field(default_factory=RepresentationSummaryConfig)
 
 
 @dataclass

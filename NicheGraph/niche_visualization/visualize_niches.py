@@ -18,8 +18,8 @@ from NicheGraph.data_prep import load_niche_inputs
 from NicheGraph.schema import NichePipelineConfig
 
 DEFAULT_WORK_DIR = Path("/Users/wuyang/Documents/SC-ST data")
-DEFAULT_CANCER = "IDC"
-DEFAULT_SAMPLE_ID = "TENX14"
+DEFAULT_CANCER = "COAD"
+DEFAULT_SAMPLE_ID = "TENX89"
 DEFAULT_PANEL_COLS = 4
 
 

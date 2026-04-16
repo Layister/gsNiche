@@ -36,7 +36,9 @@ Thumbs.db
 .mplconfig/
 
 # self-generated files
-tests/
 resources/
+scripts/
+tests/
 样本分析/
 文本文件/
+模型定位/
