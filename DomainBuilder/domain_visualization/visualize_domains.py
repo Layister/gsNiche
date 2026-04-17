@@ -24,8 +24,8 @@ from DomainBuilder.data_prep import load_domain_visualization_inputs
 from DomainBuilder.schema import DomainPipelineConfig
 
 DEFAULT_WORK_DIR = Path("/Users/wuyang/Documents/SC-ST data")
-DEFAULT_CANCER = "COAD"
-DEFAULT_SAMPLE_ID = "TENX89"
+DEFAULT_CANCER = "DLPFC"
+DEFAULT_SAMPLE_ID = "151673"
 
 
 def _build_cli() -> argparse.ArgumentParser:

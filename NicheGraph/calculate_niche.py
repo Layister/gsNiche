@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from NicheGraph.pipeline import NichePipelineConfig, run_niche_pipeline
+from utils.dataset_registry import get_dataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,36 +18,17 @@ logging.basicConfig(
 )
 
 
-# Example paths.
-work_dir = Path("/Users/wuyang/Documents/SC-ST data")
-cancer = "COAD"
-sample_ids = ["TENX89", "TENX90", "TENX91", "TENX92"]
-
-"""
-cancer = "COAD"
-sample_ids = ["TENX89", "TENX90", "TENX91", "TENX92"]
-
-cancer = "PAAD"
-sample_ids = ["NCBI569", "NCBI570", "NCBI571", "NCBI572"]
-
-cancer = "IDC"
-sample_ids = ["NCBI681", "NCBI682", "NCBI683", "TENX13", "TENX14"]
-
-cancer = "PRAD"
-sample_ids = ["INT25", "INT26", "INT27", "INT28", "TENX40", "TENX46"]
-
-cancer = "EPM"
-sample_ids = ["NCBI629", "NCBI630", "NCBI631", "NCBI632", "NCBI633"]
-"""
+dataset = get_dataset("DLPFC")
+sample_ids = dataset.sample_ids
 
 pipeline_config = NichePipelineConfig()
 
 
 def main() -> None:
     for sample_id in sample_ids:
-        domain_bundle = work_dir / cancer / "ST" / sample_id / "domain_bundle"
-        out_root = work_dir / cancer / "ST"
-        print(f"Processing {cancer} / {sample_id} ...")
+        domain_bundle = dataset.sample_dir(sample_id) / "domain_bundle"
+        out_root = dataset.out_root()
+        print(f"Processing {dataset.dataset_id} / {sample_id} ...")
         niche_bundle = run_niche_pipeline(
             domain_bundle_path=domain_bundle,
             out_root=out_root,

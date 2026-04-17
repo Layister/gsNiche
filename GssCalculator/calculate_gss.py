@@ -6,12 +6,14 @@ import warnings
 from pathlib import Path
 
 # Ensure package-style import works even when running this file directly:
-# `python /.../GssCalcu/calculate_gss.py`
+# `python /.../GssCalculator/calculate_gss.py`
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from GssCalculator.pipeline import GSSPipelineConfig, run_gss_pipeline
+from utils.dataset_registry import get_dataset
+from utils.h5ad_schema import require_gss_h5ad_schema
 
 warnings.filterwarnings("ignore", category=UserWarning, module="anndata")
 
@@ -21,32 +23,13 @@ logging.basicConfig(
 )
 
 
-# Source data root.
-work_dir = Path("/Users/wuyang/Documents/SC-ST data")
-cancer = "COAD"
-sample_ids = ["TENX89", "TENX90", "TENX91", "TENX92"]
-
-"""
-cancer = "COAD"
-sample_ids = ["TENX89", "TENX90", "TENX91", "TENX92"]
-
-cancer = "PAAD"
-sample_ids = ["NCBI569", "NCBI570", "NCBI571", "NCBI572"]
-
-cancer = "IDC"
-sample_ids = ["NCBI681", "NCBI682", "NCBI683", "TENX13", "TENX14"]
-
-cancer = "PRAD"
-sample_ids = ["INT25", "INT26", "INT27", "INT28", "TENX40", "TENX46"]
-
-cancer = "EPM"
-sample_ids = ["NCBI629", "NCBI630", "NCBI631", "NCBI632", "NCBI633"]
-
-"""
+dataset = get_dataset("DLPFC")
+sample_ids = dataset.sample_ids
 
 
 pipeline_config = GSSPipelineConfig()
-pipeline_config.preprocess.data_layer = "X"
+pipeline_config.preprocess.data_layer = dataset.data_layer
+pipeline_config.preprocess.spot_id_field = dataset.spot_id_field
 pipeline_config.latent.epochs = 300
 pipeline_config.latent.n_neighbors = 11
 pipeline_config.latent.spatial_graph_mode = "knn"
@@ -70,9 +53,15 @@ pipeline_config.qc.bootstrap_repeats = 5
 
 def main() -> None:
     for sample_id in sample_ids:
-        print(f"Processing {cancer} / {sample_id} ...")
-        h5ad_path = work_dir / cancer / "ST" / f"{sample_id}.h5ad"
-        out_root = work_dir / cancer / "ST"
+        print(f"Processing {dataset.dataset_id} / {sample_id} ...")
+        h5ad_path = dataset.h5ad_path(sample_id)
+        out_root = dataset.out_root()
+        schema_report = require_gss_h5ad_schema(
+            h5ad_path=h5ad_path,
+            dataset=dataset,
+            sample_id=sample_id,
+        )
+        print(schema_report.format_report())
 
         bundle_path = run_gss_pipeline(
             h5ad_path=h5ad_path,

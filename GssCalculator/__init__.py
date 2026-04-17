@@ -1,4 +1,4 @@
-"""GssCalcu package."""
+"""gsNiche GSS calculation package."""
 
 from .pipeline import GSSPipelineConfig, run_gss_pipeline
 
